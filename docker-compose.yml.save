@@ -1,0 +1,141 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:15
+    env_file: .env
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql
+
+  redis:
+    image: redis:7
+
+  scraper:
+    build: ./services/scraper
+    env_file: .env
+    depends_on: [postgres, redis]
+
+  worker:
+    build: ./services/worker
+    env_file: .env
+    depends_on: [postgres, redis]
+
+  applier:
+    build: ./services/applier
+    env_file: .env
+    depends_on: [postgres]
+
+  notifier:
+    build: ./services/notifier
+    env_file: .env
+
+  dashboard:
+    build: ./services/dashboard
+    ports:
+      - "8000:8000"
+    env_file: .env
+    depends_on: [postgres]
+nano db/init.sql
+CREATE TABLE IF NOT EXISTS jobs (
+  id SERIAL PRIMARY KEY,
+  title TEXT,
+  company TEXT,
+  location TEXT,
+  url TEXT UNIQUE,
+  description TEXT,
+  source TEXT,
+  fit_score INT,
+  scam_score FLOAT,
+  priority TEXT,
+  created_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS applications (
+  id SERIAL PRIMARY KEY,
+  job_id INT,
+  status TEXT,
+  applied_at TIMESTAMP DEFAULT NOW()
+);
+import os
+import psycopg2
+
+def get_conn():
+    return psycopg2.connect(os.getenv("DATABASE_URL"))
+def get_jobs():
+    return [
+        {
+            "title": "Senior Customer Success Manager",
+            "company": "ExampleCo",
+            "location": "Remote EMEA",
+            "url": "https://example.com/job1",
+            "description": "Looking for customer success leader",
+            "source": "demo"
+        }
+    ]
+import redis, json, time
+from sources import get_jobs
+
+r = redis.Redis.from_url("redis://redis:6379")
+
+while True:
+    for job in get_jobs():
+        r.rpush("jobs_raw", json.dumps(job))
+    time.sleep(60)
+import redis, json
+from shared.db import get_conn
+
+r = redis.Redis.from_url("redis://redis:6379")
+
+while True:
+    job = r.lpop("jobs_raw")
+    if not job:
+        continue
+
+    job = json.loads(job)
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    cur.execute("""
+    INSERT INTO jobs (title, company, location, url, description, source)
+    VALUES (%s,%s,%s,%s,%s,%s)
+    ON CONFLICT (url) DO NOTHING
+    """, (
+        job["title"], job["company"], job["location"],
+        job["url"], job["description"], job["source"]
+    ))
+
+    conn.commit()
+from fastapi import FastAPI
+from shared.db import get_conn
+
+app = FastAPI()
+
+@app.get("/jobs")
+def jobs():
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT title, company FROM jobs ORDER BY id DESC LIMIT 20")
+    return cur.fetchall()
+FROM python:3.11-slim
+WORKDIR /app
+COPY . .
+RUN pip install redis
+CMD ["python", "scraper.py"]
+FROM python:3.11-slim
+WORKDIR /app
+COPY . .
+RUN pip install redis psycopg2-binary
+CMD ["python", "worker.py"]
+FROM python:3.11-slim
+WORKDIR /app
+COPY . .
+RUN pip install fastapi uvicorn psycopg2-binary
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+docker compose up --build
+
+docker compose up --build --progress=plain
+cd ~/job-automation
+
